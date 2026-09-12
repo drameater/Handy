@@ -116,6 +116,37 @@ bun run tauri build
 
 This compiles a release binary and generates platform-specific bundles (deb, rpm, AppImage on Linux; dmg on macOS; msi on Windows).
 
+## macOS: Test Alongside Stable
+
+The `macOS Test` workflow on the `fix/cancel-confirmation` branch of `drameater/Handy`
+builds an Apple Silicon test app without requiring Apple signing secrets. Download
+the `handy-test-aarch64-apple-darwin` artifact from the completed Actions run and
+open the DMG inside its `dmg` directory.
+
+To produce the same bundle locally after completing the prerequisites above:
+
+```bash
+bun run tauri build --target aarch64-apple-darwin --bundles dmg --config src-tauri/tauri.test.conf.json
+```
+
+This optional profile creates `Handy Test.app` with bundle identifier
+`com.drameater.handy.test`. The normal Handy configuration remains unchanged.
+The test app uses separate settings, history, and model storage. Its update
+endpoints are empty, and Finder launches disable update checks through the
+existing `HANDY_DISABLE_UPDATER` override.
+
+Quit stable Handy before opening the test app to avoid competing global shortcuts.
+Copy `Handy Test.app` to Applications alongside `Handy.app`; do not replace stable.
+The test build is ad-hoc signed, not notarized. If macOS blocks it, use
+**System Settings > Privacy & Security > Open Anyway** for this app.
+Grant its own Microphone and Accessibility permissions, and Input Monitoring if
+requested. Complete onboarding and download a model in the test app.
+
+To return to stable, quit `Handy Test` and reopen `Handy`. If a rebuilt test app
+loses Accessibility access, use the reset procedure below with
+`com.drameater.handy.test` and `/Applications/Handy Test.app` instead of stable's
+identifier and path.
+
 ## Linux Install (from source)
 
 The raw binary (`src-tauri/target/release/handy`) cannot run standalone — it needs Tauri resource files (tray icons, sounds, VAD model) to be co-located at the expected path.

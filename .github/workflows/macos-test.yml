@@ -1,0 +1,60 @@
+name: "macOS Test"
+
+on:
+  push:
+    branches: [fix/cancel-confirmation]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    if: github.repository == 'drameater/Handy'
+    uses: ./.github/workflows/build.yml
+    with:
+      platform: macos-26
+      target: aarch64-apple-darwin
+      build-args: --target aarch64-apple-darwin --bundles dmg --config src-tauri/tauri.test.conf.json
+      sign-binaries: false
+      asset-prefix: handy-test
+      upload-artifacts: true
+
+  verify:
+    needs: build
+    runs-on: macos-26
+    permissions:
+      contents: read
+    steps:
+      - name: Download test build
+        uses: actions/download-artifact@v5
+        with:
+          name: handy-test-aarch64-apple-darwin
+          path: artifacts
+
+      - name: Verify the packaged application
+        shell: bash
+        run: |
+          set -euo pipefail
+          volume="$RUNNER_TEMP/handy-test-volume"
+          mkdir -p "$volume"
+          hdiutil attach artifacts/dmg/*.dmg -readonly -nobrowse -mountpoint "$volume"
+          trap 'hdiutil detach "$volume"' EXIT
+          python3 - "$volume/Handy Test.app" <<'PY'
+          import pathlib
+          import plistlib
+          import subprocess
+          import sys
+
+          app = pathlib.Path(sys.argv[1])
+          with (app / "Contents/Info.plist").open("rb") as file:
+              info = plistlib.load(file)
+          assert info["CFBundleIdentifier"] == "com.drameater.handy.test", info
+          assert info["LSEnvironment"]["HANDY_DISABLE_UPDATER"] == "1", info
+          assert info["NSMicrophoneUsageDescription"], info
+          binary = app / "Contents/MacOS" / info["CFBundleExecutable"]
+          subprocess.run(["codesign", "--verify", "--deep", "--strict", str(app)], check=True)
+          subprocess.run(["lipo", "-verify_arch", "arm64", str(binary)], check=True)
+          subprocess.run([str(binary), "--list-devices"], check=True, timeout=60)
+          print("Verified isolated identity, updater override, ARM64 architecture, code signature, and bundled CLI startup.")
+          PY
