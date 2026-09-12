@@ -24,6 +24,19 @@ Handy isn't trying to be the best speech-to-text app—it's trying to be the mos
 3. **Release** and Handy processes your speech using Whisper
 4. **Get** your transcribed text pasted directly into whatever app you're using
 
+**Cancelling:** Before speech is detected, the cancel hotkey or overlay cancel
+button cancels immediately. Once speech is detected or transcript text exists,
+the first press shows **Cancel?** and the next press of the **same cancel hotkey**
+confirms. Release the key between presses; holding it does not confirm.
+Recording continues while the prompt is visible, and the normal transcription
+shortcut still stops and transcribes. The overlay cancel button follows the same
+two-step rule. This also protects models that only transcribe after recording
+stops, even with VAD filtering disabled.
+
+The cancel hotkey is available during recording on macOS and Windows; use the
+overlay button during processing. Linux's dynamic cancel hotkey remains
+unavailable. Explicit tray and `--cancel` actions still cancel without confirmation.
+
 The process is entirely local:
 
 - Silence is filtered using VAD (Voice Activity Detection) with Silero

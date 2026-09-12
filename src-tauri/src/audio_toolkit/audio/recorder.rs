@@ -103,6 +103,12 @@ pub struct AudioRecorder {
     config_cache: Arc<Mutex<Option<(String, cpal::SupportedStreamConfig)>>>,
     /// Set by cpal when the active input stream can no longer capture.
     stream_error: Arc<AtomicBool>,
+    /// Speech-presence latch for the current recording. Shared with the
+    /// `AudioRecordingManager` (which owns the `Arc`, so recorder rebuilds
+    /// cannot lose it) and set by the consumer the first time the VAD
+    /// classifies a frame as speech. Reset in `begin_recording`; preserved
+    /// through `stop()` so post-stop processing stays protected.
+    speech_detected: Arc<AtomicBool>,
 }
 
 impl AudioRecorder {
@@ -117,6 +123,7 @@ impl AudioRecorder {
             selected_channel: None,
             config_cache: Arc::new(Mutex::new(None)),
             stream_error: Arc::new(AtomicBool::new(false)),
+            speech_detected: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -165,6 +172,14 @@ impl AudioRecorder {
         self
     }
 
+    /// Share the manager-owned speech-presence latch with this recorder. The
+    /// manager keeps its own clone, so replacing or closing the recorder never
+    /// loses the current recording's presence state.
+    pub fn with_speech_detected(mut self, signal: Arc<AtomicBool>) -> Self {
+        self.speech_detected = signal;
+        self
+    }
+
     pub fn set_selected_channel(&mut self, channel: Option<u16>) {
         self.selected_channel = channel.map(usize::from);
     }
@@ -200,6 +215,7 @@ impl AudioRecorder {
         let selected_channel = self.selected_channel;
         let config_cache = Arc::clone(&self.config_cache);
         let stream_error = Arc::clone(&self.stream_error);
+        let speech_detected = Arc::clone(&self.speech_detected);
 
         let worker = std::thread::spawn(move || {
             let transport = Arc::new(CaptureTransportState::default());
@@ -327,6 +343,7 @@ impl AudioRecorder {
                         level_cb,
                         audio_cb,
                         stream_running_at,
+                        speech_detected,
                     );
                     run_consumer(
                         processor,
@@ -630,12 +647,17 @@ pub fn is_no_input_device_error(error_message: &str) -> bool {
 
 /// Route one 16 kHz frame through VAD to recording and live outputs.
 /// Kept free-standing to permit disjoint borrows around resampler callbacks.
+///
+/// `speech_detected` latches the detector's real speech decisions for the
+/// active recording. `VadPolicy::Disabled` still feeds the detector (its
+/// decision only sets the latch) while forwarding every frame unfiltered.
 fn handle_frame(
     samples: &[f32],
     vad_policy: VadPolicy,
     vad: &Option<VadConfig>,
     audio_cb: &Option<AudioFrameCallback>,
     out_buf: &mut Vec<f32>,
+    speech_detected: &AtomicBool,
 ) {
     let mut emit = |buf: &[f32]| {
         out_buf.extend_from_slice(buf);
@@ -644,18 +666,31 @@ fn handle_frame(
         }
     };
 
-    if vad_policy == VadPolicy::Disabled {
+    // With filtering disabled, detection has no further work once speech is
+    // latched. Continue forwarding untouched audio without running inference.
+    if vad_policy == VadPolicy::Disabled && speech_detected.load(Ordering::Acquire) {
         emit(samples);
         return;
     }
 
     if let Some(cfg) = vad {
         let mut detector = cfg.detector.lock().unwrap();
-        match detector
+        let frame = detector
             .push_frame(samples)
-            .unwrap_or(VadFrame::Speech(samples))
-        {
-            VadFrame::Speech(buf) => emit(buf),
+            .unwrap_or(VadFrame::Speech(samples));
+        if vad_policy == VadPolicy::Disabled {
+            // Detection only: never drop audio under the Disabled policy.
+            if frame.is_speech() {
+                speech_detected.store(true, Ordering::Release);
+            }
+            emit(samples);
+            return;
+        }
+        match frame {
+            VadFrame::Speech(buf) => {
+                speech_detected.store(true, Ordering::Release);
+                emit(buf);
+            }
             VadFrame::Noise => {}
         }
     } else {
@@ -709,6 +744,11 @@ struct CaptureProcessor {
     frame_resampler: FrameResampler,
     max_drain_samples: usize,
     first_chunk_logged: bool,
+    /// Manager-owned speech latch: set on the first VAD speech frame of the
+    /// active recording. Stream-scoped storage, recording-scoped value —
+    /// `begin_recording` clears it and nothing clears it at stop, so the
+    /// finished recording's presence survives until the next start.
+    speech_detected: Arc<AtomicBool>,
 
     // ---- recording-scoped: reset by `begin_recording` ------------------- //
     vad_policy: VadPolicy,
@@ -726,6 +766,7 @@ impl CaptureProcessor {
         level_cb: Option<LevelCallback>,
         audio_cb: Option<AudioFrameCallback>,
         stream_running_at: Instant,
+        speech_detected: Arc<AtomicBool>,
     ) -> Self {
         // Resample into frames sized for the active VAD backend (30 ms when
         // no detector is attached) so the detector never sees a partial frame.
@@ -762,6 +803,7 @@ impl CaptureProcessor {
             frame_resampler,
             max_drain_samples,
             first_chunk_logged: false,
+            speech_detected,
             vad_policy: VadPolicy::Offline,
             processed_samples: Vec::new(),
             awaiting_first_captured_chunk: None,
@@ -781,12 +823,13 @@ impl CaptureProcessor {
         self.processed_samples.clear();
         self.visualizer.reset();
         self.frame_resampler.reset();
-        if policy != VadPolicy::Disabled {
-            if let Some(cfg) = &self.vad {
-                let mut detector = cfg.detector.lock().unwrap();
-                detector.set_hangover_frames(cfg.hangover_for(policy));
-                detector.reset();
-            }
+        self.speech_detected.store(false, Ordering::Release);
+        // Reconfigure and reset under every policy: `Disabled` also feeds the
+        // detector now (detection only), so its state must be per-recording.
+        if let Some(cfg) = &self.vad {
+            let mut detector = cfg.detector.lock().unwrap();
+            detector.set_hangover_frames(cfg.hangover_for(policy));
+            detector.reset();
         }
     }
 
@@ -835,6 +878,7 @@ impl CaptureProcessor {
                 &self.vad,
                 &self.audio_cb,
                 &mut self.processed_samples,
+                &self.speech_detected,
             )
         });
 
@@ -878,6 +922,7 @@ impl CaptureProcessor {
                 &self.vad,
                 &self.audio_cb,
                 &mut self.processed_samples,
+                &self.speech_detected,
             )
         });
 
