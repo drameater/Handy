@@ -54,7 +54,7 @@ jobs:
           assert info["NSMicrophoneUsageDescription"], info
           binary = app / "Contents/MacOS" / info["CFBundleExecutable"]
           subprocess.run(["codesign", "--verify", "--deep", "--strict", str(app)], check=True)
-          subprocess.run(["lipo", "-verify_arch", "arm64", str(binary)], check=True)
+          subprocess.run(["lipo", str(binary), "-verify_arch", "arm64"], check=True)
           subprocess.run([str(binary), "--list-devices"], check=True, timeout=60)
           print("Verified isolated identity, updater override, ARM64 architecture, code signature, and bundled CLI startup.")
           PY
