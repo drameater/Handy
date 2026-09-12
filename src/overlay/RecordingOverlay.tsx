@@ -11,6 +11,8 @@ import type {
 } from "@/bindings";
 import i18n, { syncLanguageFromSettings } from "@/i18n";
 import { getLanguageDirection } from "@/lib/utils/rtl";
+import { formatKeyCombination } from "@/lib/utils/keyboard";
+import { useOsType } from "@/hooks/useOsType";
 
 type OverlayState = "recording" | "streaming" | "transcribing" | "processing";
 
@@ -26,6 +28,7 @@ const RecordingOverlay: React.FC = () => {
   // Stay visually in an arming state until the backend processes the first
   // actual microphone sample chunk.
   const [captureReady, setCaptureReady] = useState(false);
+  const osType = useOsType();
   const [levels, setLevels] = useState<number[]>(Array(WAVE_BARS).fill(0));
   const [streamText, setStreamText] = useState<StreamTextEvent>({
     committed: "",
@@ -43,6 +46,17 @@ const RecordingOverlay: React.FC = () => {
   // True once live text overflows the cap. A top overlay fades its top edge only
   // while overflowing, so the resting first line stays crisp flush under the pill.
   const [overflowing, setOverflowing] = useState(false);
+  // Armed cancel confirmation: object arms the prompt (`hotkey` null when the
+  // binding is unavailable, e.g. Linux), null clears it. Never resets
+  // transcript/readiness/timer — it only swaps the status row.
+  const [cancelConfirm, setCancelConfirm] = useState<{
+    hotkey: string | null;
+  } | null>(null);
+  // True when the overlay renders only because a confirmation armed while it
+  // was hidden (the backend sized/showed the native window for us). Shows a
+  // compact prompt with no stale session text; hides again on clear.
+  const [confirmOnly, setConfirmOnly] = useState(false);
+  const visibleRef = useRef(false);
 
   const smoothedLevelsRef = useRef<number[]>(Array(16).fill(0));
   // Live-text scroll-back: the text region "sticks" to the newest line while the
@@ -53,32 +67,40 @@ const RecordingOverlay: React.FC = () => {
   const direction = getLanguageDirection(i18n.language);
 
   useEffect(() => {
+    let disposed = false;
+    let lifecycle = 0;
+    let cleanup: (() => void) | undefined;
+
+    const syncPresentation = async (version: number) => {
+      await syncLanguageFromSettings();
+      const settings = await commands.getAppSettings();
+      if (!disposed && version === lifecycle && settings.status === "ok") {
+        setPosition(
+          settings.data.overlay_position === "top" ? "top" : "bottom",
+        );
+      }
+    };
+
     const setupEventListeners = async () => {
-      const unlistenShow = await listen("show-overlay", async (event) => {
+      const unlistenShow = await listen("show-overlay", (event) => {
         const overlayState = event.payload as OverlayState;
+        const version = ++lifecycle;
+        visibleRef.current = true;
+        setConfirmOnly(false);
         // Reset synchronously before settings I/O. A fast microphone can emit
         // recording-ready while the awaits below are in flight; resetting after
         // them would overwrite that event and leave the overlay stuck arming.
         if (overlayState === "recording" || overlayState === "streaming") {
+          setCancelConfirm(null);
           setCaptureReady(false);
           smoothedLevelsRef.current = Array(16).fill(0);
           setLevels(Array(WAVE_BARS).fill(0));
           setStreamText({ committed: "", tentative: "" });
         }
 
-        await syncLanguageFromSettings();
-        // The Live panel flows downward from a top overlay and upward from a
-        // bottom one; read the placement so the layout can flip to match.
-        try {
-          const settings = await commands.getAppSettings();
-          if (settings.status === "ok") {
-            setPosition(
-              settings.data.overlay_position === "top" ? "top" : "bottom",
-            );
-          }
-        } catch {
-          // Keep the previous/default placement if settings can't be read.
-        }
+        void syncPresentation(version).catch(() => {
+          // Keep the previous placement if settings cannot be read.
+        });
         setState(overlayState);
         if (overlayState === "streaming") {
           setPhase("listening");
@@ -90,8 +112,12 @@ const RecordingOverlay: React.FC = () => {
       });
 
       const unlistenHide = await listen("hide-overlay", () => {
+        lifecycle += 1;
+        visibleRef.current = false;
         setIsVisible(false);
         setCaptureReady(false);
+        setCancelConfirm(null);
+        setConfirmOnly(false);
       });
 
       const unlistenReady = await listen("recording-ready", () => {
@@ -119,7 +145,32 @@ const RecordingOverlay: React.FC = () => {
         const payload: StreamPhaseEvent = event.payload;
         setPhase(payload.phase);
         if (payload.kind) setWorkKind(payload.kind);
+        // Polishing updates keep phase "working" while the backend stays in
+        // the same Processing stage — an armed confirmation survives those;
+        // the backend emits its own clear on genuine stop/start/completion.
+        if (payload.phase !== "working") {
+          setCancelConfirm(null);
+          setConfirmOnly(false);
+        }
       });
+
+      // Raw Tauri event (not in the generated bindings): `{ hotkey } | null`.
+      const unlistenConfirm = await listen<{ hotkey: string | null } | null>(
+        "cancel-confirmation",
+        (event) => {
+          setCancelConfirm(event.payload);
+          if (event.payload && !visibleRef.current) {
+            void syncPresentation(lifecycle).catch(() => {
+              // Keep the previous placement if settings cannot be read.
+            });
+          }
+          // Arming while hidden renders the compact prompt only; a genuinely
+          // visible overlay is already on screen and resumes its status row
+          // when the confirmation clears.
+          if (event.payload) setConfirmOnly(!visibleRef.current);
+          else setConfirmOnly(false);
+        },
+      );
 
       return () => {
         unlistenShow();
@@ -128,10 +179,18 @@ const RecordingOverlay: React.FC = () => {
         unlistenLevel();
         unlistenStream();
         unlistenPhase();
+        unlistenConfirm();
       };
     };
 
-    setupEventListeners();
+    void setupEventListeners().then((unlisten) => {
+      if (disposed) unlisten();
+      else cleanup = unlisten;
+    });
+    return () => {
+      disposed = true;
+      cleanup?.();
+    };
   }, []);
 
   // Elapsed capture timer starts only once microphone samples are flowing.
@@ -157,7 +216,7 @@ const RecordingOverlay: React.FC = () => {
     setOverflowing(false);
   }, [session]);
 
-  if (!isVisible) return null;
+  if (!isVisible && !confirmOnly) return null;
 
   // Re-pin when the user is within ~a line of the bottom; unpin otherwise.
   const handleStreamScroll = () => {
@@ -183,10 +242,14 @@ const RecordingOverlay: React.FC = () => {
     </div>
   );
 
+  // First cancel (hotkey or this button) only requests cancellation once speech
+  // exists; the backend arms the confirmation, and the same action confirms.
   const cancelBtn = (
     <button
       className="sx"
-      aria-label="cancel"
+      aria-label={
+        cancelConfirm ? t("overlay.cancelConfirm") : t("overlay.cancel")
+      }
       onClick={() => commands.cancelOperation()}
     >
       <svg viewBox="0 0 16 16" aria-hidden="true">
@@ -227,6 +290,35 @@ const RecordingOverlay: React.FC = () => {
     </div>
   );
 
+  // Armed confirmation — replaces the status row in place (the live transcript
+  // above keeps streaming; only this row swaps).
+  const formattedHotkey = cancelConfirm?.hotkey
+    ? formatKeyCombination(cancelConfirm.hotkey, osType)
+    : null;
+  const confirmRow = (
+    <div className="sbase sconfirm" role="status">
+      <div className="sbase-l">
+        <span className="sdot arming" />
+      </div>
+      <span className="sconfirm-label">
+        {formattedHotkey
+          ? t("overlay.cancelPromptHotkey", { hotkey: formattedHotkey })
+          : t("overlay.cancelPrompt")}
+      </span>
+      <div className="sbase-r">{cancelBtn}</div>
+    </div>
+  );
+
+  // Confirmation armed while hidden: a compact prompt alone — no stale
+  // transcript from a previous session, no timer.
+  if (confirmOnly && !isVisible) {
+    return (
+      <div dir={direction} className={`ov-stage ${position} ov-fade show`}>
+        <div className="scard compact confirming">{confirmRow}</div>
+      </div>
+    );
+  }
+
   // ---- Live overlay: a pill that sculpts open into a panel ----
   if (state === "streaming") {
     const hasText =
@@ -244,8 +336,8 @@ const RecordingOverlay: React.FC = () => {
         <div
           key={session}
           className={`scard ${open ? "open" : ""} ${collapsed ? "working" : ""} ${
-            isVisible ? "" : "leaving"
-          }`}
+            cancelConfirm ? "confirming" : ""
+          } ${isVisible ? "" : "leaving"}`}
         >
           <div className="stext">
             <div className="stext-clip">
@@ -266,14 +358,16 @@ const RecordingOverlay: React.FC = () => {
               </div>
             </div>
           </div>
-          {working
-            ? workingRow(
-                workKind === "polishing"
-                  ? t("overlay.processing")
-                  : t("overlay.transcribing"),
-                true,
-              )
-            : listeningRow(open, true)}
+          {cancelConfirm
+            ? confirmRow
+            : working
+              ? workingRow(
+                  workKind === "polishing"
+                    ? t("overlay.processing")
+                    : t("overlay.transcribing"),
+                  true,
+                )
+              : listeningRow(open, true)}
         </div>
       </div>
     );
@@ -294,9 +388,15 @@ const RecordingOverlay: React.FC = () => {
       className={`ov-stage ${position} ov-fade ${isVisible ? "show" : ""}`}
     >
       <div
-        className={`scard compact ${working && isVisible ? "cworking" : ""}`}
+        className={`scard compact ${working && isVisible ? "cworking" : ""} ${
+          cancelConfirm ? "confirming" : ""
+        }`}
       >
-        {working ? workingRow(workLabel, true) : listeningRow(false, true)}
+        {cancelConfirm
+          ? confirmRow
+          : working
+            ? workingRow(workLabel, true)
+            : listeningRow(false, true)}
       </div>
     </div>
   );

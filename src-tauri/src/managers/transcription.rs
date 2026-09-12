@@ -277,6 +277,9 @@ pub struct TranscriptionManager {
     /// `is_model_loaded()` consults this so the model still reports "loaded"
     /// while the worker holds it.
     active_engine_lease: Arc<AtomicU64>,
+    /// Recording generation in the upper bits; low bit latches nonempty text.
+    /// A stale streaming worker cannot mark a newer recording as nonempty.
+    transcription_presence: Arc<AtomicU64>,
 }
 
 impl TranscriptionManager {
@@ -297,6 +300,7 @@ impl TranscriptionManager {
             next_stream_worker_id: Arc::new(AtomicU64::new(1)),
             active_stream_worker: Arc::new(AtomicU64::new(0)),
             active_engine_lease: Arc::new(AtomicU64::new(0)),
+            transcription_presence: Arc::new(AtomicU64::new(0)),
         };
 
         // Start the idle watcher
@@ -801,6 +805,38 @@ impl TranscriptionManager {
         Arc::clone(&self.router)
     }
 
+    /// Start a fresh recording's text-presence latch without waiting for a
+    /// cancelled worker to relinquish its engine.
+    pub fn reset_transcription_presence(&self) {
+        let _ = self.transcription_presence.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |value| Some((value.wrapping_add(2)) & !1),
+        );
+    }
+
+    /// Whether this recording has produced any non-whitespace transcript text.
+    pub fn has_transcribed_speech(&self) -> bool {
+        self.transcription_presence.load(Ordering::Acquire) & 1 != 0
+    }
+
+    /// Mark text from the active recording pipeline, not a history retranscription.
+    pub fn note_recording_transcript(&self, text: &str) {
+        let generation = self.transcription_presence.load(Ordering::Acquire) & !1;
+        self.note_transcription_presence(generation, text);
+    }
+
+    fn note_transcription_presence(&self, generation: u64, text: &str) {
+        if !text.trim().is_empty() {
+            let _ = self.transcription_presence.compare_exchange(
+                generation,
+                generation | 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
+    }
+
     /// Begin a live streaming transcription on the held engine's session.
     /// Audio frames pushed via [`StreamRouter::feed`] (captured directly by the
     /// audio recorder) are decoded incrementally and emitted to the overlay as
@@ -829,10 +865,11 @@ impl TranscriptionManager {
         self.stream_active.store(false, Ordering::Release);
 
         let manager = self.clone();
-        thread::spawn(move || manager.run_stream_worker(rx, worker_id));
+        let generation = self.transcription_presence.load(Ordering::Acquire) & !1;
+        thread::spawn(move || manager.run_stream_worker(rx, worker_id, generation));
     }
 
-    fn run_stream_worker(&self, rx: mpsc::Receiver<StreamCmd>, worker_id: u64) {
+    fn run_stream_worker(&self, rx: mpsc::Receiver<StreamCmd>, worker_id: u64, generation: u64) {
         let _worker = StreamWorkerGuard {
             worker_id,
             active_stream_worker: Arc::clone(&self.active_stream_worker),
@@ -1002,7 +1039,11 @@ impl TranscriptionManager {
                                 if update.committed_changed || update.tentative_changed {
                                     let text = stream.text();
                                     perf.record_emit();
-                                    self.emit_stream_text(&text.committed, &text.tentative);
+                                    self.emit_stream_text(
+                                        generation,
+                                        &text.committed,
+                                        &text.tentative,
+                                    );
                                 }
                                 perf.maybe_log();
                             }
@@ -1037,8 +1078,10 @@ impl TranscriptionManager {
                                     }
                                     resolved => resolved.clone(),
                                 };
+                                let text = stream.text().full;
+                                self.note_transcription_presence(generation, &text);
                                 Some(FinalizedStreamText {
-                                    text: stream.text().full,
+                                    text,
                                     output_language,
                                     supported_languages: languages.clone(),
                                 })
@@ -1165,7 +1208,9 @@ impl TranscriptionManager {
         .emit(&self.app_handle);
     }
 
-    fn emit_stream_text(&self, committed: &str, tentative: &str) {
+    fn emit_stream_text(&self, generation: u64, committed: &str, tentative: &str) {
+        self.note_transcription_presence(generation, committed);
+        self.note_transcription_presence(generation, tentative);
         let _ = StreamTextEvent {
             committed: committed.to_string(),
             tentative: tentative.to_string(),
