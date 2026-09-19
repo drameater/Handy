@@ -9,7 +9,35 @@ permissions:
   contents: write
 
 jobs:
+  regression:
+    if: github.repository == 'drameater/Handy'
+    runs-on: macos-26
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+          key: macos-cancel-regressions
+          cache-bin: false
+
+      - name: Test cancellation coordinator
+        working-directory: src-tauri
+        run: cargo test --locked --lib transcription_coordinator -- --nocapture
+
+      - name: Test speech-presence recording
+        working-directory: src-tauri
+        run: cargo test --locked --lib audio_toolkit::audio::recorder -- --nocapture
+
   build:
+    needs: regression
     if: github.repository == 'drameater/Handy'
     uses: ./.github/workflows/build.yml
     with:

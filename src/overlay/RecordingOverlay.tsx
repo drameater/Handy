@@ -247,9 +247,7 @@ const RecordingOverlay: React.FC = () => {
   const cancelBtn = (
     <button
       className="sx"
-      aria-label={
-        cancelConfirm ? t("overlay.cancelConfirm") : t("overlay.cancel")
-      }
+      aria-label={t("tray.cancel")}
       onClick={() => commands.cancelOperation()}
     >
       <svg viewBox="0 0 16 16" aria-hidden="true">
@@ -301,9 +299,7 @@ const RecordingOverlay: React.FC = () => {
         <span className="sdot arming" />
       </div>
       <span className="sconfirm-label">
-        {formattedHotkey
-          ? t("overlay.cancelPromptHotkey", { hotkey: formattedHotkey })
-          : t("overlay.cancelPrompt")}
+        {t("tray.cancel")}?{formattedHotkey && <> {formattedHotkey}</>}
       </span>
       <div className="sbase-r">{cancelBtn}</div>
     </div>
