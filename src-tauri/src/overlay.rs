@@ -55,7 +55,7 @@ const OVERLAY_STREAM_HEIGHT: f64 = 120.0;
 
 /// Overlay window size (logical) for a given UI state.
 fn overlay_dimensions(state: &str) -> (f64, f64) {
-    if state == "streaming" {
+    if state == "streaming" || state == "cancel-confirmation" {
         (OVERLAY_STREAM_WIDTH, OVERLAY_STREAM_HEIGHT)
     } else {
         (OVERLAY_WIDTH, OVERLAY_HEIGHT)
@@ -509,7 +509,12 @@ fn show_overlay_state(app_handle: &AppHandle, state: &str) {
 
 fn show_overlay_state_on_main(app_handle: &AppHandle, state: &str) {
     // Size the overlay for this state (compact vs. streaming), then position it.
-    let (width, height) = overlay_dimensions(state);
+    let dimensions_state = if CANCEL_CONFIRMATION_ACTIVE.load(Ordering::Relaxed) {
+        "cancel-confirmation"
+    } else {
+        state
+    };
+    let (width, height) = overlay_dimensions(dimensions_state);
     if let Some(overlay_window) = app_handle.get_webview_window("recording_overlay") {
         // Invalidate any delayed hide still in flight from a previous session
         // (see `hide_recording_overlay`).
@@ -538,7 +543,10 @@ fn show_overlay_state_on_main(app_handle: &AppHandle, state: &str) {
             let _ =
                 overlay_window.set_size(tauri::Size::Logical(tauri::LogicalSize { width, height }));
             #[cfg(target_os = "windows")]
-            WINDOWS_OVERLAY_IS_STREAMING.store(state == "streaming", Ordering::Relaxed);
+            WINDOWS_OVERLAY_IS_STREAMING.store(
+                dimensions_state == "streaming" || dimensions_state == "cancel-confirmation",
+                Ordering::Relaxed,
+            );
             let size_elapsed = size_started.elapsed();
 
             let pos_started = std::time::Instant::now();
@@ -589,8 +597,71 @@ fn show_overlay_state_on_main(app_handle: &AppHandle, state: &str) {
             );
         }
 
-        let _ = overlay_window.emit("show-overlay", state);
+        if state != "cancel-confirmation" {
+            let _ = overlay_window.emit("show-overlay", state);
+        }
     }
+}
+
+static CANCEL_CONFIRMATION_GENERATION: AtomicU64 = AtomicU64::new(0);
+static CANCEL_CONFIRMATION_ACTIVE: AtomicBool = AtomicBool::new(false);
+static CONFIRMATION_ONLY: AtomicBool = AtomicBool::new(false);
+
+#[derive(Clone, serde::Serialize)]
+struct CancelConfirmation {
+    hotkey: Option<String>,
+}
+
+/// Show confirmation without replaying the recording overlay's session reset.
+/// Confirmation remains visible even when the normal recording overlay is off.
+pub fn show_cancel_confirmation(app_handle: &AppHandle, hotkey_available: bool) {
+    let generation = CANCEL_CONFIRMATION_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+    let handle = app_handle.clone();
+    let _ = app_handle.run_on_main_thread(move || {
+        if CANCEL_CONFIRMATION_GENERATION.load(Ordering::SeqCst) != generation {
+            return;
+        }
+        let settings = settings::get_settings(&handle);
+        CANCEL_CONFIRMATION_ACTIVE.store(true, Ordering::Relaxed);
+        CONFIRMATION_ONLY.store(
+            settings.overlay_style == OverlayStyle::None,
+            Ordering::SeqCst,
+        );
+        // Dynamic cancellation hotkeys are not registered on Linux.
+        let hotkey = if !hotkey_available || cfg!(target_os = "linux") {
+            None
+        } else {
+            settings
+                .bindings
+                .get("cancel")
+                .map(|binding| binding.current_binding.clone())
+        };
+        show_overlay_state_on_main(&handle, "cancel-confirmation");
+        let _ = handle.emit_to(
+            "recording_overlay",
+            "cancel-confirmation",
+            Some(CancelConfirmation { hotkey }),
+        );
+    });
+}
+
+/// Invalidate queued prompts and dismiss a confirmation-only native window.
+pub fn clear_cancel_confirmation(app_handle: &AppHandle) {
+    CANCEL_CONFIRMATION_GENERATION.fetch_add(1, Ordering::SeqCst);
+    let handle = app_handle.clone();
+    let _ = app_handle.run_on_main_thread(move || {
+        CANCEL_CONFIRMATION_ACTIVE.store(false, Ordering::Relaxed);
+        let _ = handle.emit_to(
+            "recording_overlay",
+            "cancel-confirmation",
+            Option::<CancelConfirmation>::None,
+        );
+        if CONFIRMATION_ONLY.swap(false, Ordering::SeqCst) {
+            if let Some(window) = handle.get_webview_window("recording_overlay") {
+                let _ = window.hide();
+            }
+        }
+    });
 }
 
 /// Notify the visible recording overlay that the input stream has delivered its
@@ -687,6 +758,7 @@ static OVERLAY_SHOW_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 /// Hides the recording overlay window with fade-out animation
 pub fn hide_recording_overlay(app_handle: &AppHandle) {
+    clear_cancel_confirmation(app_handle);
     // Always hide the overlay regardless of settings - if setting was changed while recording,
     // we still want to hide it properly
     if let Some(overlay_window) = app_handle.get_webview_window("recording_overlay") {
