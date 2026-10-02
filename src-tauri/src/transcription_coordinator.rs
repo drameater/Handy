@@ -1,5 +1,6 @@
 use crate::actions::ACTION_MAP;
 use crate::managers::audio::AudioRecordingManager;
+use crate::managers::transcription::TranscriptionManager;
 use crate::settings::ShortcutActivation;
 use log::{debug, error, warn};
 use std::sync::mpsc::{self, Sender};
@@ -167,10 +168,18 @@ enum Effect {
     },
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum CancelDecision {
+    Ignore,
+    Confirm,
+    Cancel,
+}
+
 /// Commands processed sequentially by the coordinator thread.
 enum Command {
     Input(InputEvent),
-    Cancel { recording_was_active: bool },
+    ForceCancel,
+    RequestCancel { key_pressed: Option<bool> },
     ProcessingFinished,
 }
 
@@ -222,6 +231,8 @@ struct CoordinatorState {
     last_press: Option<Instant>,
     pending_release: Option<PendingRelease>,
     pending_press: Option<PendingPress>,
+    cancel_armed: bool,
+    cancel_key_down: bool,
 }
 
 impl CoordinatorState {
@@ -232,6 +243,8 @@ impl CoordinatorState {
             last_press: None,
             pending_release: None,
             pending_press: None,
+            cancel_armed: false,
+            cancel_key_down: false,
         }
     }
 
@@ -458,7 +471,42 @@ impl CoordinatorState {
         None
     }
 
+    /// A click is a complete activation; keyboard confirmation requires a release
+    /// between presses so auto-repeat cannot discard a recording.
+    fn on_cancel_request(
+        &mut self,
+        key_pressed: Option<bool>,
+        has_content: bool,
+    ) -> CancelDecision {
+        if let Some(pressed) = key_pressed {
+            if !pressed {
+                self.cancel_key_down = false;
+                return CancelDecision::Ignore;
+            }
+            if self.cancel_key_down {
+                return CancelDecision::Ignore;
+            }
+            self.cancel_key_down = true;
+            // Keep the existing hotkey lifetime: recording only. Overlay clicks
+            // can also cancel the processing pipeline.
+            if !matches!(self.stage, Stage::Recording(_)) {
+                return CancelDecision::Ignore;
+            }
+        }
+        if self.stage == Stage::Idle {
+            return CancelDecision::Ignore;
+        }
+        if !has_content || self.cancel_armed {
+            self.cancel_armed = false;
+            CancelDecision::Cancel
+        } else {
+            self.cancel_armed = true;
+            CancelDecision::Confirm
+        }
+    }
+
     fn on_cancel(&mut self, recording_was_active: bool) {
+        self.cancel_armed = false;
         self.pending_release = None;
         // An explicit cancel abandons any remembered start too — the user
         // asked for silence, not a deferred recording.
@@ -473,6 +521,7 @@ impl CoordinatorState {
     }
 
     fn on_processing_finished(&mut self) -> Option<Effect> {
+        self.cancel_armed = false;
         self.stage = Stage::Idle;
         self.hold = None;
         let pending = self.pending_press.take()?;
@@ -492,6 +541,7 @@ impl CoordinatorState {
     /// whether recording actually began (microphone access can be denied).
     fn on_start_result(&mut self, binding_id: &str, started: bool) {
         if !started && matches!(&self.stage, Stage::Recording(id) if id == binding_id) {
+            self.cancel_armed = false;
             self.stage = Stage::Idle;
             self.hold = None;
         }
@@ -507,6 +557,8 @@ impl CoordinatorState {
         pressed_at: Instant,
         locked: bool,
     ) -> Effect {
+        self.cancel_armed = false;
+        self.cancel_key_down = false;
         self.stage = Stage::Recording(binding_id.clone());
         self.hold = Some(Hold { pressed_at, locked });
         Effect::Start {
@@ -516,6 +568,7 @@ impl CoordinatorState {
     }
 
     fn begin_processing(&mut self, binding_id: String, hotkey_string: String) -> Effect {
+        self.cancel_armed = false;
         self.stage = Stage::Processing;
         self.hold = None;
         Effect::Stop {
@@ -571,10 +624,25 @@ impl TranscriptionCoordinator {
                                 run_effect(&app, &mut state, effect);
                             }
                         }
-                        Command::Cancel {
-                            recording_was_active,
-                        } => state.on_cancel(recording_was_active),
+                        Command::ForceCancel => cancel(&app, &mut state),
+                        Command::RequestCancel { key_pressed } => {
+                            let audio = app.state::<Arc<AudioRecordingManager>>();
+                            let transcription = app.state::<Arc<TranscriptionManager>>();
+                            let has_content = audio.has_recorded_speech()
+                                || transcription.has_transcribed_speech();
+                            match state.on_cancel_request(key_pressed, has_content) {
+                                CancelDecision::Ignore => {}
+                                CancelDecision::Confirm => {
+                                    crate::overlay::show_cancel_confirmation(
+                                        &app,
+                                        matches!(state.stage, Stage::Recording(_)),
+                                    );
+                                }
+                                CancelDecision::Cancel => cancel(&app, &mut state),
+                            }
+                        }
                         Command::ProcessingFinished => {
+                            crate::overlay::clear_cancel_confirmation(&app);
                             if let Some(effect) = state.on_processing_finished() {
                                 run_effect(&app, &mut state, effect);
                             }
@@ -649,12 +717,19 @@ impl TranscriptionCoordinator {
         }
     }
 
-    pub fn notify_cancel(&self, recording_was_active: bool) {
+    /// Force cancellation for explicit tray/CLI actions, without confirmation.
+    pub fn force_cancel(&self) {
+        if self.tx.send(Command::ForceCancel).is_err() {
+            warn!("Transcription coordinator channel closed");
+        }
+    }
+
+    /// Request cancellation from the existing hotkey (`Some(pressed)`) or an
+    /// overlay click (`None`). Decisions run on the lifecycle thread.
+    pub fn request_cancel(&self, key_pressed: Option<bool>) {
         if self
             .tx
-            .send(Command::Cancel {
-                recording_was_active,
-            })
+            .send(Command::RequestCancel { key_pressed })
             .is_err()
         {
             warn!("Transcription coordinator channel closed");
@@ -669,6 +744,7 @@ impl TranscriptionCoordinator {
 }
 
 fn run_effect(app: &AppHandle, state: &mut CoordinatorState, effect: Effect) {
+    crate::overlay::clear_cancel_confirmation(app);
     match effect {
         Effect::Start {
             binding_id,
@@ -682,6 +758,12 @@ fn run_effect(app: &AppHandle, state: &mut CoordinatorState, effect: Effect) {
             hotkey_string,
         } => stop(app, &binding_id, &hotkey_string),
     }
+}
+
+fn cancel(app: &AppHandle, state: &mut CoordinatorState) {
+    let recording_was_active = app.state::<Arc<AudioRecordingManager>>().is_recording();
+    crate::utils::execute_cancellation(app);
+    state.on_cancel(recording_was_active);
 }
 
 /// Execute a start effect; returns whether recording actually began, so the
@@ -1613,5 +1695,92 @@ mod tests {
             "held 400ms since the real key-down: must stop, not lock"
         );
         assert_eq!(state.stage, Stage::Processing);
+    }
+
+    #[test]
+    fn silent_recording_cancels_on_first_activation() {
+        for key_pressed in [Some(true), None] {
+            let mut state = CoordinatorState::new();
+            state.on_input(toggle_input(true), Instant::now());
+            assert_eq!(
+                state.on_cancel_request(key_pressed, false),
+                CancelDecision::Cancel
+            );
+        }
+    }
+
+    #[test]
+    fn speech_requires_a_second_distinct_cancel_press_without_a_timeout() {
+        let mut state = CoordinatorState::new();
+        let now = Instant::now();
+        state.on_input(toggle_input(true), now);
+        assert_eq!(
+            state.on_cancel_request(Some(true), true),
+            CancelDecision::Confirm
+        );
+        assert_eq!(state.stage, Stage::Recording(BINDING.to_string()));
+        for _ in 0..10 {
+            assert_eq!(
+                state.on_cancel_request(Some(true), true),
+                CancelDecision::Ignore
+            );
+        }
+        assert_eq!(
+            state.on_cancel_request(Some(false), true),
+            CancelDecision::Ignore
+        );
+        assert_eq!(
+            state.on_cancel_request(Some(true), true),
+            CancelDecision::Cancel
+        );
+        state.on_cancel(true);
+        assert_eq!(state.stage, Stage::Idle);
+    }
+
+    #[test]
+    fn confirmation_does_not_block_normal_stop_or_carry_into_processing() {
+        let mut state = CoordinatorState::new();
+        let now = Instant::now();
+        state.on_input(toggle_input(true), now);
+        assert_eq!(state.on_cancel_request(None, true), CancelDecision::Confirm);
+        assert!(matches!(
+            state.on_input(toggle_input(true), now + Duration::from_secs(1)),
+            Some(Effect::Stop { .. })
+        ));
+        assert_eq!(
+            state.on_cancel_request(None, true),
+            CancelDecision::Confirm,
+            "processing must require its own confirmation"
+        );
+        assert_eq!(state.on_cancel_request(None, true), CancelDecision::Cancel);
+    }
+
+    #[test]
+    fn cancellation_confirmation_cannot_leak_into_another_session() {
+        let mut state = CoordinatorState::new();
+        let now = Instant::now();
+        state.on_input(toggle_input(true), now);
+        assert_eq!(
+            state.on_cancel_request(Some(true), true),
+            CancelDecision::Confirm
+        );
+        state.on_cancel(true);
+        state.on_input(toggle_input(true), now + Duration::from_secs(1));
+        assert_eq!(
+            state.on_cancel_request(Some(true), true),
+            CancelDecision::Confirm
+        );
+    }
+
+    #[test]
+    fn idle_cancel_is_ignored_and_click_can_confirm_a_keyboard_request() {
+        let mut state = CoordinatorState::new();
+        assert_eq!(state.on_cancel_request(None, true), CancelDecision::Ignore);
+        state.on_input(toggle_input(true), Instant::now());
+        assert_eq!(
+            state.on_cancel_request(Some(true), true),
+            CancelDecision::Confirm
+        );
+        assert_eq!(state.on_cancel_request(None, true), CancelDecision::Cancel);
     }
 }

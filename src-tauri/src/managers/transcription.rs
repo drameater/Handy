@@ -273,6 +273,9 @@ pub struct TranscriptionManager {
     /// yet. This prevents a second worker from starting after finalize/cancel
     /// closes the router but before the first worker has fully exited.
     active_stream_worker: Arc<AtomicU64>,
+    /// Recording generation in the upper bits; low bit latches nonempty text.
+    /// A stale streaming worker cannot mark a newer recording as nonempty.
+    transcription_presence: Arc<AtomicU64>,
 }
 
 impl TranscriptionManager {
@@ -293,6 +296,7 @@ impl TranscriptionManager {
             stream_active: Arc::new(AtomicBool::new(false)),
             next_stream_worker_id: Arc::new(AtomicU64::new(1)),
             active_stream_worker: Arc::new(AtomicU64::new(0)),
+            transcription_presence: Arc::new(AtomicU64::new(0)),
         };
 
         // Start the idle watcher
@@ -831,6 +835,27 @@ impl TranscriptionManager {
         Arc::clone(&self.router)
     }
 
+    /// Start a fresh recording's text-presence latch without waiting for a
+    /// cancelled worker to relinquish its engine.
+    pub fn reset_transcription_presence(&self) {
+        let _ = self.transcription_presence.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |value| Some((value.wrapping_add(2)) & !1),
+        );
+    }
+
+    /// Whether this recording has produced any non-whitespace transcript text.
+    pub fn has_transcribed_speech(&self) -> bool {
+        self.transcription_presence.load(Ordering::Acquire) & 1 != 0
+    }
+
+    /// Mark text from the active recording pipeline, not a history retranscription.
+    pub fn note_recording_transcript(&self, text: &str) {
+        let generation = self.transcription_presence.load(Ordering::Acquire) & !1;
+        note_transcription_presence(&self.transcription_presence, generation, text, "");
+    }
+
     /// Begin a live streaming transcription on the held engine's session.
     /// Audio frames pushed via [`StreamRouter::feed`] (captured directly by the
     /// audio recorder) are decoded incrementally and emitted to the overlay as
@@ -859,10 +884,11 @@ impl TranscriptionManager {
         self.stream_active.store(false, Ordering::Release);
 
         let manager = self.clone();
-        thread::spawn(move || manager.run_stream_worker(rx, worker_id));
+        let generation = self.transcription_presence.load(Ordering::Acquire) & !1;
+        thread::spawn(move || manager.run_stream_worker(rx, worker_id, generation));
     }
 
-    fn run_stream_worker(&self, rx: mpsc::Receiver<StreamCmd>, worker_id: u64) {
+    fn run_stream_worker(&self, rx: mpsc::Receiver<StreamCmd>, worker_id: u64, generation: u64) {
         let _worker = StreamWorkerGuard {
             worker_id,
             active_stream_worker: Arc::clone(&self.active_stream_worker),
@@ -935,19 +961,26 @@ impl TranscriptionManager {
             ..Default::default()
         };
 
-        // Feed results arrive on the engine's thread; this callback only
-        // converts and emits preview text.
+        // Feed results arrive on the engine's thread; this callback latches
+        // recording text presence, then converts and emits preview text.
         let perf = Arc::new(Mutex::new(StreamPerf::new()));
         let on_progress = {
             let perf = Arc::clone(&perf);
             let app_handle = self.app_handle.clone();
             let languages = languages.clone();
+            let transcription_presence = Arc::clone(&self.transcription_presence);
             let mut preview_script = PreviewScript::new(settings.chinese_script, &output_language);
             move |progress: StreamProgress| {
                 let mut perf = lock_perf(&perf);
                 perf.record_compute(progress.elapsed);
                 perf.record_update(&progress.update);
                 if let Some(text) = progress.text {
+                    note_transcription_presence(
+                        &transcription_presence,
+                        generation,
+                        &text.committed,
+                        &text.tentative,
+                    );
                     perf.record_emit();
                     let (committed, tentative) =
                         preview_script.convert(&text.committed, &text.tentative, &languages);
@@ -1002,6 +1035,12 @@ impl TranscriptionManager {
                             let mut perf = lock_perf(&perf);
                             perf.record_compute(finalized.elapsed);
                             perf.record_update(&finalized.update);
+                            note_transcription_presence(
+                                &self.transcription_presence,
+                                generation,
+                                &finalized.text.full,
+                                "",
+                            );
                             let output_language = match &output_language {
                                 OutputLanguageEvidence::Unknown => with_model_detected_language(
                                     OutputLanguageEvidence::Unknown,
@@ -1524,6 +1563,25 @@ struct RunOutcome {
     /// INVALID_ARG, so the whisper extension must be gated on the arch, not
     /// on the feature (see #1601).
     model_is_whisper: bool,
+}
+
+fn note_transcription_presence(
+    presence: &AtomicU64,
+    generation: u64,
+    committed: &str,
+    tentative: &str,
+) {
+    if presence.load(Ordering::Acquire) != generation {
+        return;
+    }
+    if !committed.trim().is_empty() || !tentative.trim().is_empty() {
+        let _ = presence.compare_exchange(
+            generation,
+            generation | 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
 }
 
 fn emit_stream_text(app_handle: &AppHandle, committed: &str, tentative: &str) {
@@ -2143,6 +2201,38 @@ mod tests {
 
     fn languages(codes: &[&str]) -> Vec<String> {
         codes.iter().map(|code| (*code).to_string()).collect()
+    }
+
+    #[test]
+    fn transcription_presence_latches_committed_or_tentative_text() {
+        for (committed, tentative, expected) in [
+            ("", "", false),
+            (" \t\n", "\u{2003}", false),
+            (" speech ", "", true),
+            (" \n", " speech ", true),
+        ] {
+            let presence = AtomicU64::new(2);
+            note_transcription_presence(&presence, 2, committed, tentative);
+            assert_eq!(presence.load(Ordering::Acquire) & 1 != 0, expected);
+
+            // An empty or retracted preview never forgets previously seen text.
+            note_transcription_presence(&presence, 2, "", "");
+            assert_eq!(presence.load(Ordering::Acquire) & 1 != 0, expected);
+        }
+    }
+
+    #[test]
+    fn stale_stream_progress_cannot_mark_next_recording() {
+        let presence = AtomicU64::new(2);
+        note_transcription_presence(&presence, 0, "old committed", "");
+        note_transcription_presence(&presence, 0, "", "old tentative");
+        assert_eq!(presence.load(Ordering::Acquire), 2);
+
+        note_transcription_presence(&presence, 2, "", "current tentative");
+        assert_eq!(presence.load(Ordering::Acquire), 3);
+
+        note_transcription_presence(&presence, 0, "old finalized", "");
+        assert_eq!(presence.load(Ordering::Acquire), 3);
     }
 
     #[test]

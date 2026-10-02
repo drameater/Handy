@@ -282,6 +282,7 @@ fn create_audio_recorder(
     app_handle: &tauri::AppHandle,
     selected_channel: Option<u16>,
     stream_router: Arc<StreamRouter>,
+    speech_detected: Arc<AtomicBool>,
 ) -> Result<AudioRecorder, anyhow::Error> {
     let detector: Box<dyn VoiceActivityDetector> = match backend {
         VadBackend::Silero => {
@@ -334,6 +335,7 @@ fn create_audio_recorder(
             offline_hangover_frames,
             streaming_hangover_frames,
         )
+        .with_speech_detected(speech_detected)
         .with_selected_channel(selected_channel)
         .with_level_callback({
             let app_handle = app_handle.clone();
@@ -395,6 +397,12 @@ pub struct AudioRecordingManager {
     /// stopped or cancelled. This prevents a slow device from producing a late
     /// "ready" indication for a session the user already ended.
     capture_generation: Arc<AtomicU64>,
+    /// Manager-owned speech-presence latch for the current recording, shared
+    /// into every recorder this manager builds. Owning it here means recorder
+    /// rebuilds/closes (VAD backend swap, stream error recovery) cannot lose
+    /// the current recording's presence. Cleared before a new start, latched by
+    /// the recorder's consumer; read lock-free via `has_recorded_speech()`.
+    speech_detected: Arc<AtomicBool>,
     /// Resolution of a *named* microphone (selected or clamshell) to its cpal
     /// device, cached so on-demand recording starts skip the full device
     /// enumeration (~40-110ms). Keyed by the resolved name, so a settings
@@ -432,6 +440,7 @@ impl AudioRecordingManager {
             stream_router,
             recording_active: Arc::new(AtomicBool::new(false)),
             capture_generation: Arc::new(AtomicU64::new(0)),
+            speech_detected: Arc::new(AtomicBool::new(false)),
             cached_device: Arc::new(Mutex::new(None)),
         };
 
@@ -629,6 +638,7 @@ impl AudioRecordingManager {
                 &self.app_handle,
                 settings.selected_channel,
                 Arc::clone(&self.stream_router),
+                Arc::clone(&self.speech_detected),
             )?);
         }
         Ok(())
@@ -821,6 +831,9 @@ impl AudioRecordingManager {
         let mut state = self.state.lock().unwrap();
 
         if let RecordingState::Idle = *state {
+            // Clear before the asynchronous Start command, so cancellation
+            // during microphone arming cannot see the previous session's speech.
+            self.speech_detected.store(false, Ordering::Release);
             // Cancel any pending lazy close (no-op in always-on mode, where
             // closes are never scheduled).
             self.close_generation.fetch_add(1, Ordering::SeqCst);
@@ -879,6 +892,7 @@ impl AudioRecordingManager {
             &self.app_handle,
             settings.selected_channel,
             Arc::clone(&self.stream_router),
+            Arc::clone(&self.speech_detected),
         )?;
         let was_open = *self.is_open.lock().unwrap();
 
@@ -1064,6 +1078,18 @@ impl AudioRecordingManager {
         // across a slow CoreAudio open/close → main-thread deadlock / UI
         // freeze).
         self.recording_active.load(Ordering::SeqCst)
+    }
+
+    /// True once the VAD has classified any frame of the current recording as
+    /// speech. Latched: stays true through later silence and through stop, so
+    /// post-stop processing remains protected; reset by the recorder's
+    /// consumer at every recording start. Never set by always-on idle audio
+    /// (idle chunks are discarded before the VAD). Works even when VAD
+    /// filtering is Disabled — the detector still runs for detection only.
+    ///
+    /// Lock-free single atomic load; safe to poll from the shortcut/UI path.
+    pub fn has_recorded_speech(&self) -> bool {
+        self.speech_detected.load(Ordering::Acquire)
     }
 
     /// Cancel any ongoing recording without returning audio samples

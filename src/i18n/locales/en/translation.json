@@ -174,7 +174,7 @@
           },
           "cancel": {
             "name": "Cancel Shortcut",
-            "description": "The keyboard shortcut to cancel the current recording."
+            "description": "The keyboard shortcut to cancel the current recording. Once speech has been detected, the first press asks for confirmation — press the shortcut again (or click cancel) to confirm."
           },
           "transcribe_with_post_process": {
             "name": "Post-Processing Hotkey",

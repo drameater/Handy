@@ -81,9 +81,17 @@ fn native_windows_machine() -> Option<u16> {
     }
 }
 
-/// Centralized cancellation function that can be called from anywhere in the app.
-/// Handles cancelling both recording and transcription operations and updates UI state.
+/// Request unconditional cancellation from explicit tray and CLI actions.
+/// Serializing cleanup with recording transitions prevents a late cancellation
+/// notification from resetting a newer session.
 pub fn cancel_current_operation(app: &AppHandle) {
+    if let Some(coordinator) = app.try_state::<TranscriptionCoordinator>() {
+        coordinator.force_cancel();
+    }
+}
+
+/// Execute cancellation on the transcription coordinator's lifecycle thread.
+pub(crate) fn execute_cancellation(app: &AppHandle) {
     info!("Initiating operation cancellation...");
 
     // Unregister the cancel shortcut asynchronously
@@ -91,7 +99,6 @@ pub fn cancel_current_operation(app: &AppHandle) {
 
     // Cancel any ongoing recording
     let audio_manager = app.state::<Arc<AudioRecordingManager>>();
-    let recording_was_active = audio_manager.is_recording();
     audio_manager.cancel_recording();
 
     // Abandon any live streaming transcription, and stop a transcription
@@ -104,15 +111,9 @@ pub fn cancel_current_operation(app: &AppHandle) {
     set_tray_state(app, crate::tray::TrayIconState::Idle);
     hide_recording_overlay(app);
 
-    // Unload model if immediate unload is enabled. Done before notifying the
-    // coordinator, so a recording started next always loads afresh; it
-    // doesn't wait for the cancelled work, so it never blocks this thread.
+    // Unload before the coordinator can start the next recording. Cancellation
+    // does not wait for the abandoned work, so it never blocks this thread.
     tm.maybe_unload_immediately("cancellation");
-
-    // Notify coordinator so it can keep lifecycle state coherent.
-    if let Some(coordinator) = app.try_state::<TranscriptionCoordinator>() {
-        coordinator.notify_cancel(recording_was_active);
-    }
 
     info!("Operation cancellation completed - returned to idle state");
 }
