@@ -466,3 +466,29 @@
   overflow: hidden;
   text-overflow: ellipsis;
 }
+
+/* cancel confirmation — replaces the status row in place. The native window is
+   400px wide while armed, so the prompt can breathe past the pill widths but
+   stays inside the window with the same 4px side margins as the Live panel. */
+.scard.confirming:not(.open) {
+  width: max-content;
+  max-width: min(calc(var(--ov-open-w) - 8px), calc(100vw - 2px));
+}
+.sconfirm {
+  /* Long bindings wrap to a second line instead of ellipsizing — the whole
+     hotkey must stay readable so the user knows what to press again. */
+  height: auto;
+  min-height: var(--ov-base-h);
+  box-sizing: border-box;
+  padding-top: 4px;
+  padding-bottom: 4px;
+}
+.sconfirm-label {
+  font-size: 12px;
+  line-height: 1.3;
+  color: var(--s-muted);
+  text-align: center;
+  padding: 0 8px;
+  min-width: 0;
+  overflow-wrap: break-word;
+}

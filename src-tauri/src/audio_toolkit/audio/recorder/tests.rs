@@ -59,6 +59,7 @@ fn resampler_frame_size_follows_the_vad_backend() {
             observed.lock().unwrap().push(frame.len())
         })),
         Instant::now(),
+        Arc::new(AtomicBool::new(false)),
     );
 
     let (ready_tx, _ready_rx) = mpsc::channel();
@@ -72,9 +73,115 @@ fn resampler_frame_size_follows_the_vad_backend() {
 
 #[test]
 fn idle_chunks_are_discarded_without_reaching_the_recording() {
-    let mut processor = CaptureProcessor::new(16_000, None, None, None, Instant::now());
+    let mut processor = CaptureProcessor::new(
+        16_000,
+        None,
+        None,
+        None,
+        Instant::now(),
+        Arc::new(AtomicBool::new(false)),
+    );
     processor.process_raw_chunk(&[1.0; 480], ChunkDisposition::Discard);
     assert!(processor.finish_recording().is_empty());
+}
+
+/// Detector that classifies a frame as speech iff it contains any non-zero
+/// sample, standing in for a real backend's voiced/unvoiced decisions.
+struct AmplitudeVad;
+
+impl VoiceActivityDetector for AmplitudeVad {
+    fn push_frame<'a>(&'a mut self, frame: &'a [f32]) -> anyhow::Result<VadFrame<'a>> {
+        if frame.iter().any(|&sample| sample != 0.0) {
+            Ok(VadFrame::Speech(frame))
+        } else {
+            Ok(VadFrame::Noise)
+        }
+    }
+
+    fn frame_samples(&self) -> usize {
+        480
+    }
+}
+
+fn processor_with_amplitude_vad() -> (CaptureProcessor, Arc<AtomicBool>) {
+    let speech_detected = Arc::new(AtomicBool::new(false));
+    let vad = VadConfig {
+        detector: Arc::new(Mutex::new(Box::new(AmplitudeVad))),
+        frame_samples: 480,
+        offline_hangover_frames: 0,
+        streaming_hangover_frames: 0,
+    };
+    let processor = CaptureProcessor::new(
+        16_000,
+        Some(vad),
+        None,
+        None,
+        Instant::now(),
+        Arc::clone(&speech_detected),
+    );
+    (processor, speech_detected)
+}
+
+#[test]
+fn speech_latch_sets_on_speech_and_survives_silence_and_stop() {
+    let (mut processor, speech_detected) = processor_with_amplitude_vad();
+    let (ready_tx, _ready_rx) = mpsc::channel();
+    processor.begin_recording(VadPolicy::Offline, ready_tx);
+
+    processor.process_raw_chunk(&[0.0; 480], ChunkDisposition::Capture);
+    assert!(!speech_detected.load(Ordering::Acquire));
+
+    processor.process_raw_chunk(&[0.5; 480], ChunkDisposition::Capture);
+    assert!(speech_detected.load(Ordering::Acquire));
+
+    // Later silence must not clear the latch...
+    processor.process_raw_chunk(&[0.0; 480], ChunkDisposition::Capture);
+    assert!(speech_detected.load(Ordering::Acquire));
+
+    // ...and stop (finish) must preserve it so processing stays protected.
+    let _ = processor.finish_recording();
+    assert!(speech_detected.load(Ordering::Acquire));
+}
+
+#[test]
+fn idle_audio_never_sets_the_latch_and_a_new_recording_resets_it() {
+    let (mut processor, speech_detected) = processor_with_amplitude_vad();
+
+    // Always-on idle speech is discarded before the VAD; it must not count.
+    processor.process_raw_chunk(&[0.5; 480], ChunkDisposition::Discard);
+    assert!(!speech_detected.load(Ordering::Acquire));
+
+    let (ready_tx, _ready_rx) = mpsc::channel();
+    processor.begin_recording(VadPolicy::Offline, ready_tx);
+    processor.process_raw_chunk(&[0.5; 480], ChunkDisposition::Capture);
+    assert!(speech_detected.load(Ordering::Acquire));
+
+    // The next recording starts with a clean latch.
+    let _ = processor.finish_recording();
+    let (ready_tx, _ready_rx) = mpsc::channel();
+    processor.begin_recording(VadPolicy::Offline, ready_tx);
+    assert!(!speech_detected.load(Ordering::Acquire));
+}
+
+#[test]
+fn disabled_policy_still_detects_speech_without_filtering_audio() {
+    let (mut processor, speech_detected) = processor_with_amplitude_vad();
+    let (ready_tx, _ready_rx) = mpsc::channel();
+    processor.begin_recording(VadPolicy::Disabled, ready_tx);
+
+    processor.process_raw_chunk(&[0.0; 480], ChunkDisposition::Capture);
+    assert!(!speech_detected.load(Ordering::Acquire));
+
+    processor.process_raw_chunk(&[0.5; 480], ChunkDisposition::Capture);
+    assert!(speech_detected.load(Ordering::Acquire));
+    processor.process_raw_chunk(&[0.0; 480], ChunkDisposition::Capture);
+
+    // Disabled filtering: every captured sample is kept, silence included.
+    let samples = processor.finish_recording();
+    assert_eq!(samples.len(), 1440);
+    assert!(samples[..480].iter().all(|&sample| sample == 0.0));
+    assert!(samples[480..960].iter().all(|&sample| sample == 0.5));
+    assert!(samples[960..].iter().all(|&sample| sample == 0.0));
 }
 
 #[test]
@@ -84,7 +191,14 @@ fn shutdown_is_processed_without_audio_samples() {
     let (done_tx, done_rx) = mpsc::channel();
     let worker = thread::spawn(move || {
         run_consumer(
-            CaptureProcessor::new(48_000, None, None, None, Instant::now()),
+            CaptureProcessor::new(
+                48_000,
+                None,
+                None,
+                None,
+                Instant::now(),
+                Arc::new(AtomicBool::new(false)),
+            ),
             consumer,
             cmd_rx,
             Arc::new(CaptureTransportState::default()),
@@ -249,6 +363,7 @@ fn repeated_start_stop_cycles_resume_capture_without_leaking_samples() {
                 streamed_cb.lock().unwrap().extend_from_slice(frame)
             })),
             Instant::now(),
+            Arc::new(AtomicBool::new(false)),
         );
         run_consumer(
             processor,
@@ -356,7 +471,14 @@ fn missing_callback_at_stop_marks_stream_for_rebuild_and_returns_samples() {
     let worker_transport = Arc::clone(&transport);
     let worker = thread::spawn(move || {
         run_consumer(
-            CaptureProcessor::new(16_000, None, None, None, Instant::now()),
+            CaptureProcessor::new(
+                16_000,
+                None,
+                None,
+                None,
+                Instant::now(),
+                Arc::new(AtomicBool::new(false)),
+            ),
             consumer,
             cmd_rx,
             worker_transport,
